@@ -5,7 +5,6 @@ const { NovelStatus } = require("@libs/novelStatus");
 const { defaultCover } = require("@libs/defaultCover");
 
 const SITE = "https://world-novel.fr/";
-
 const normalizeSpace = (s) => String(s || "").replace(/\s+/g, " ").trim();
 
 function abs(url) {
@@ -87,110 +86,76 @@ function metadata(html, slug) {
   };
 }
 
-function normalizeChapterPath(href) {
-  return String(href || "")
-    .replace(/^https?:\/\/[^/]+\//i, "")
-    .replace(/^\//, "")
-    .split("#")[0];
+function chapterNumberFrom(text) {
+  const m = String(text || "").match(/(?:chapitre|chapter)\s*(\d+(?:\.\d+)?)/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
 }
 
-function chapterNumberFrom(text, href) {
-  const source = `${text || ""} ${href || ""}`;
-  const patterns = [
-    /(?:chapitre|chapter)[^0-9]{0,15}(\d+(?:\.\d+)?)/i,
-    /(?:chapitres?|chapters?)[\/_-](\d+(?:\.\d+)?)/i,
-    /[\/_-](\d{1,5})(?:[\/_-]|$)/,
-  ];
-  for (const p of patterns) {
-    const m = source.match(p);
-    if (m) {
-      const n = Number(m[1]);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return null;
-}
-
-function chapterLinks(html, slug) {
+function chapterLinks(html) {
   const out = [];
   const seen = new Set();
-  const anchors = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  const re = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
   let m;
-  while ((m = anchors.exec(html))) {
+  while ((m = re.exec(html))) {
     const href = m[1];
     const name = stripTags(m[2]);
-    const haystack = `${href} ${name}`;
-    if (!/(chapitre|chapter)/i.test(haystack)) continue;
+    if (!/(chapitre|chapter)/i.test(`${href} ${name}`)) continue;
+    const n = chapterNumberFrom(name) ?? chapterNumberFrom(decodeURIComponent(href));
+    if (n == null) continue;
+    const path = href.replace(/^https?:\/\/[^/]+\//i, "").replace(/^\//, "").split("#")[0];
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push({ name: name || `Chapitre ${n}`, path, chapterNumber: n });
+  }
+  return out.sort((a, b) => a.chapterNumber - b.chapterNumber);
+}
 
-    const n = chapterNumberFrom(name, href);
+// New VNH/WorldNovel pages embed volume/chapter data in Next.js RSC payloads.
+// In the HTML source the JSON is usually escaped, e.g. {\"volumeId\":\"...\", ...}.
+function chaptersFromEmbeddedRsc(html, slug) {
+  const out = [];
+  const seen = new Set();
+
+  // Normalize escaped JSON-like strings enough for robust field matching.
+  const src = String(html || "")
+    .replace(/\\u0026/g, "&")
+    .replace(/\\u0027/g, "'")
+    .replace(/\\u003c/g, "<")
+    .replace(/\\u003e/g, ">")
+    .replace(/\\"/g, '"');
+
+  // Actual shape observed on world-novel.fr:
+  // {"id":"Chapitre 3000 – ...","title":"...","date":"23/05/2026",
+  //  "volumeId":"AZ...","volumeDisplayName":"Volume 11 - ...","ts":177...}
+  const re = /\{"id":"([^"]*?(?:Chapitre|Chapter)\s*\d+[^"]*)","title":"([^"]*)","date":"([^"]*)","volumeId":"([^"]+)","volumeDisplayName":"([^"]*)","ts":([0-9]+)\}/gi;
+  let m;
+
+  while ((m = re.exec(src))) {
+    const id = m[1];
+    const title = m[2] || id;
+    const date = m[3] || undefined;
+    const volumeId = m[4];
+    const volumeName = m[5] || undefined;
+    const ts = Number(m[6]);
+    const n = chapterNumberFrom(title) ?? chapterNumberFrom(id);
     if (n == null) continue;
 
-    const path = normalizeChapterPath(href);
-    if (!path || seen.has(path)) continue;
-
-    // Prefer links related to this novel, but do not reject generic chapter routes.
-    if (slug && /\/oeuvres\//i.test(path) && !path.includes(slug)) continue;
-
+    const encodedTitle = encodeURIComponent(id).replace(/'/g, "%27");
+    const path = `lecture/${slug}/volumes/${encodeURIComponent(volumeId)}/chapitres/${encodedTitle}`;
+    if (seen.has(path)) continue;
     seen.add(path);
+
     out.push({
-      name: name || `Chapitre ${n}`,
+      name: title,
       path,
       chapterNumber: n,
+      releaseTime: Number.isFinite(ts) ? ts : date,
+      scanlator: volumeName,
     });
   }
 
-  return out.sort((a, b) => a.chapterNumber - b.chapterNumber);
-}
-
-function collectJsonChapters(value, slug, out, seen) {
-  if (value == null) return;
-  if (Array.isArray(value)) {
-    for (const v of value) collectJsonChapters(v, slug, out, seen);
-    return;
-  }
-  if (typeof value !== "object") return;
-
-  const numRaw = value.chapterNumber ?? value.chapter_number ?? value.number ?? value.chapterNo ?? value.chapter_no ?? value.chapter;
-  const hrefRaw = value.path ?? value.url ?? value.href ?? value.slug;
-  const title = normalizeSpace(value.title ?? value.name ?? value.chapterTitle ?? "");
-  const n = Number(numRaw);
-
-  if (Number.isFinite(n) && hrefRaw) {
-    let path = normalizeChapterPath(String(hrefRaw));
-    if (!path.includes("/") && slug) path = `oeuvres/${slug}/chapitres/${path}`;
-    if (!seen.has(path)) {
-      seen.add(path);
-      out.push({
-        name: title || `Chapitre ${n}`,
-        path,
-        chapterNumber: n,
-        releaseTime: value.createdAt || value.publishedAt || value.releaseDate || undefined,
-      });
-    }
-  }
-
-  for (const v of Object.values(value)) collectJsonChapters(v, slug, out, seen);
-}
-
-function chaptersFromJson(data, slug) {
-  const out = [];
-  const seen = new Set();
-  collectJsonChapters(data, slug, out, seen);
-  return out.sort((a, b) => a.chapterNumber - b.chapterNumber);
-}
-
-function scriptsJson(html, slug) {
-  const out = [];
-  const seen = new Set();
-  const scripts = [];
-
-  for (const m of html.matchAll(/<script\b[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi)) scripts.push(m[1]);
-  const next = html.match(/<script\b[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (next) scripts.push(next[1]);
-
-  for (const raw of scripts) {
-    try { collectJsonChapters(JSON.parse(raw), slug, out, seen); } catch (_) {}
-  }
   return out.sort((a, b) => a.chapterNumber - b.chapterNumber);
 }
 
@@ -198,47 +163,14 @@ function chapterContent(html) {
   const article = (html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i) || [])[1];
   const main = (html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i) || [])[1];
   let body = article || main || html;
-
   body = body
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
     .replace(/<(?:nav|footer|aside)\b[\s\S]*?<\/(?:nav|footer|aside)>/gi, "");
-
   return [...body.matchAll(/<(?:h1|h2|p)\b[^>]*>[\s\S]*?<\/(?:h1|h2|p)>/gi)]
     .map((m) => m[0])
     .filter((x) => stripTags(x).length > 0)
     .join("");
-}
-
-function chapterContentFromJson(html) {
-  const raws = [...html.matchAll(/<script\b[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi)].map((m) => m[1]);
-  const next = html.match(/<script\b[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
-  if (next) raws.push(next[1]);
-
-  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-
-  function walk(v) {
-    if (!v) return null;
-    if (Array.isArray(v)) {
-      if (v.length > 2 && v.every((x) => typeof x === "string" || (x && typeof x.content === "string"))) {
-        return v.map((x) => `<p>${esc(typeof x === "string" ? x : x.content)}</p>`).join("");
-      }
-      for (const x of v) { const r = walk(x); if (r) return r; }
-    } else if (typeof v === "object") {
-      for (const key of ["paragraphs", "content", "chapterContent", "text", "body"]) {
-        if (v[key]) { const r = walk(v[key]); if (r) return r; }
-      }
-      for (const x of Object.values(v)) { const r = walk(x); if (r) return r; }
-    } else if (typeof v === "string" && v.length > 500) {
-      return /<p\b/i.test(v) ? v : `<p>${esc(v)}</p>`;
-    }
-    return null;
-  }
-
-  for (const raw of raws) {
-    try { const r = walk(JSON.parse(raw)); if (r) return r; } catch (_) {}
-  }
-  return "";
 }
 
 class WorldNovelPlugin {
@@ -247,7 +179,7 @@ class WorldNovelPlugin {
     this.name = "WorldNovel (VNH Fix)";
     this.icon = "";
     this.site = SITE;
-    this.version = "0.2.0";
+    this.version = "0.3.0";
   }
 
   async get(url) {
@@ -258,11 +190,7 @@ class WorldNovelPlugin {
       },
     });
     if (!r.ok) throw new Error(`WorldNovel: HTTP ${r.status}`);
-    return {
-      text: await r.text(),
-      contentType: r.headers?.get?.("content-type") || "",
-      url: r.url || url,
-    };
+    return { text: await r.text(), url: r.url || url };
   }
 
   async popularNovels(pageNo) {
@@ -302,27 +230,8 @@ class WorldNovelPlugin {
     const { text } = await this.get(abs(canonicalPath));
     const m = metadata(text, slug);
 
-    let chapters = chapterLinks(text, slug);
-    if (!chapters.length) chapters = scriptsJson(text, slug);
-
-    if (!chapters.length) {
-      const endpoints = [
-        `${this.site}api/chapters/${slug}`,
-        `${this.site}api/oeuvres/${slug}/chapitres`,
-        `${this.site}api/oeuvres/${slug}/chapters`,
-        `${this.site}api/chapters?oeuvre=${encodeURIComponent(slug)}`,
-        `${this.site}api/chapters?slug=${encodeURIComponent(slug)}`,
-      ];
-
-      for (const url of endpoints) {
-        try {
-          const r = await this.get(url);
-          const data = JSON.parse(r.text);
-          chapters = chaptersFromJson(data, slug);
-          if (chapters.length) break;
-        } catch (_) {}
-      }
-    }
+    let chapters = chaptersFromEmbeddedRsc(text, slug);
+    if (!chapters.length) chapters = chapterLinks(text);
 
     return {
       path: canonicalPath,
@@ -342,11 +251,7 @@ class WorldNovelPlugin {
     const { text } = await this.get(abs(path));
     const direct = chapterContent(text);
     if (stripTags(direct).length > 300) return direct;
-
-    const embedded = chapterContentFromJson(text);
-    if (embedded) return embedded;
-
-    throw new Error("WorldNovel: contenu du chapitre introuvable");
+    throw new Error("WorldNovel: contenu du chapitre chargé dynamiquement; endpoint CDN à intégrer ensuite");
   }
 
   resolveUrl(path) {
