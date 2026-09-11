@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const { fetchApi } = require("@libs/fetch");
 const { NovelStatus } = require("@libs/novelStatus");
 const { defaultCover } = require("@libs/defaultCover");
+const { storage } = require("@libs/storage");
 
 const SITE = "https://world-novel.fr/";
 const CDN = "https://cdn.world-novel.fr/chapitres/";
@@ -237,7 +238,14 @@ class WorldNovelPlugin {
     this.name = "WorldNovel (VNH Fix)";
     this.icon = "";
     this.site = SITE;
-    this.version = "0.4.0";
+    this.version = "0.4.1";
+    this.pluginSettings = {
+      worldNovelUserId: {
+        value: "",
+        label: "WorldNovel userId (Firebase UID)",
+        type: "Text",
+      },
+    };
   }
 
   async request(url, referer = SITE, throwOnHttp = true) {
@@ -310,11 +318,11 @@ class WorldNovelPlugin {
     const chapterUrl = abs(route.path);
 
     let pageText = "";
-    let userId = null;
+    let userId = String(storage.get("worldNovelUserId") || "").trim() || null;
     try {
       const page = await this.request(chapterUrl, SITE, false);
       pageText = page.text || "";
-      userId = extractUserId(pageText);
+      if (!userId) userId = extractUserId(pageText);
     } catch (_) {}
 
     const cdnPath = `${route.slug}/${route.volumeId}/${route.title}`;
@@ -341,11 +349,14 @@ class WorldNovelPlugin {
       if (direct) return decodeObfuscatedChapter(pageText);
     }
 
+    if (!userId) {
+      throw new Error("WorldNovel: userId manquant. Renseigne-le dans les paramètres du plugin WorldNovel.");
+    }
     if (lastStatus === 401 || lastStatus === 403) {
-      throw new Error("WorldNovel: accès CDN refusé. Connecte-toi dans le WebView WorldNovel puis réessaie.");
+      throw new Error("WorldNovel: accès CDN refusé avec le userId configuré.");
     }
     if (lastText && /userId/i.test(lastText)) {
-      throw new Error("WorldNovel: le CDN demande l'identifiant de session WorldNovel.");
+      throw new Error("WorldNovel: le CDN a refusé le userId configuré.");
     }
     throw new Error(`WorldNovel: impossible de charger le chapitre via le CDN${lastStatus ? ` (HTTP ${lastStatus})` : ""}`);
   }
